@@ -1,0 +1,12 @@
+[Unit]
+Description=Toggle HDR with charger state (KDE Plasma / Wayland)
+Documentation=https://bugs.kde.org/show_bug.cgi?id=509230
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hdr-power
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

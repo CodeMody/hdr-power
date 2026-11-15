@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# hdr-power — KDE Plasma 6 / Wayland version of Windows' "HDR on charger, HDR off on battery".
+#
+# Watches the mains adapter's online state in /sys/class/power_supply and
+# toggles HDR on a chosen output via kscreen-doctor:
+#   charger connected   -> HDR enabled
+#   charger unplugged   -> HDR disabled
+#
+# Usage:
+#   hdr-power          run as a daemon (what the systemd service uses)
+#   hdr-power once     apply the desired HDR state once and exit (handy for testing)
+#
+# Config (drop in ~/.config/hdr-power/environment or via systemd Environment=):
+#   HDR_POWER_OUTPUT   display to control (default: eDP-1)
+#   HDR_POWER_PSU      power supply name under /sys/class/power_supply (default: ACAD)
+#   HDR_POWER_POLL     poll interval in seconds (default: 1)
+
+set -u
+
+# Optional config file (wins over systemd Environment=, which wins over defaults below)
+ENV_FILE="${HDR_POWER_ENV:-${HOME}/.config/hdr-power/environment}"
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+OUTPUT="${HDR_POWER_OUTPUT:-eDP-1}"
+PSU="${HDR_POWER_PSU:-ACAD}"
+POLL_INTERVAL="${HDR_POWER_POLL:-1}"
+ONLINE_FILE="/sys/class/power_supply/${PSU}/online"
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
+
+# kscreen-doctor needs WAYLAND_DISPLAY. Try to take it from the live KWin process
+# so we do not depend on what environment the systemd user manager happens to
+# have; if that is not readable (Yama ptrace_scope), fall back to the active
+# wayland socket in $XDG_RUNTIME_DIR.
+detect_wayland() {
+    local pid f
+    pid=$(pgrep -u "$(id -u)" -x kwin_wayland | head -1)
+    f="/proc/${pid:-0}/environ"
+    if [ -r "$f" ]; then
+        tr '\0' '\n' < "$f" 2>/dev/null | sed -n 's/^WAYLAND_DISPLAY=//p' | head -1
+    else
+        local sock
+        sock=$(find "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" -maxdepth 1 -name 'wayland-*' ! -name '*.lock' ! -name '*.lock*' 2>/dev/null | sort | head -1)
+        [ -n "$sock" ] && basename "$sock"
+    fi
+}
+
+use_session_env() {
+    local wd
+    wd=$(detect_wayland)
+    [ -n "$wd" ] && export WAYLAND_DISPLAY="$wd"
+}
+
+# Wait (max ~5 min) until KWin is up and kscreen-doctor answers; needed when
+# the service starts at login before the graphical session is fully ready.
+wait_for_session() {
+    local i=0
+    while [ "$i" -lt 150 ]; do
+        use_session_env
+        if [ -n "${WAYLAND_DISPLAY:-}" ] && kscreen-doctor -o >/dev/null 2>&1; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 2
+    done
+    return 1
+}
+
+is_online() { [ "$(cat "$ONLINE_FILE" 2>/dev/null)" = "1" ]; }
+
+# Returns 0 = HDR enabled, 1 = HDR disabled, 2 = output/HDR info not found
+hdr_enabled() {
+    local line
+    line=$(kscreen-doctor -o 2>/dev/null | grep -A30 " ${OUTPUT} " | grep -m1 'HDR:')
+    [ -n "$line" ] || return 2
+    [[ "$line" == *"HDR:"*enabled* ]]
+}
+
+sync() {
+    local want have
+    if is_online; then want=enable; else want=disable; fi
+
+    if hdr_enabled; then have=enable
+    elif [ $? -eq 1 ]; then have=disable
+    else return 0   # output not found (yet) — nothing to do
+    fi
+
+    [ "$want" = "$have" ] && return 0
+
+    if kscreen-doctor "output.${OUTPUT}.hdr.${want}" >/dev/null; then
+        local charger_state="unplugged"; [ "$want" = enable ] && charger_state="connected"
+        log "HDR ${want} on ${OUTPUT} (charger ${charger_state})"
+    else
+        log "WARNING: failed to set HDR ${want} on ${OUTPUT}"
+    fi
+}
+
+if [ ! -r "$ONLINE_FILE" ]; then
+    log "ERROR: ${ONLINE_FILE} not readable — no mains adapter found; exiting."
+    exit 1
+fi
+
+if [ "${1:-loop}" = "once" ]; then
+    use_session_env
+    sync
+    exit 0
+fi
+
+if ! wait_for_session; then
+    log "No usable Plasma/Wayland session appeared within 5 minutes; exiting."
+    exit 0
+fi
+
+log "Started: HDR on ${OUTPUT} follows charger ${PSU} (poll every ${POLL_INTERVAL}s)"
+
+prev=$(cat "$ONLINE_FILE" 2>/dev/null)
+sync
+
+while :; do
+    sleep "$POLL_INTERVAL"
+    cur=$(cat "$ONLINE_FILE" 2>/dev/null) || continue
+    if [ "$cur" != "$prev" ]; then
+        prev="$cur"
+        sync
+    fi
+done
